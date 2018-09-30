@@ -1,20 +1,35 @@
+/*
+   Written by W. Hoogervorst
+   Fire alarm detector
+   Version 7, HTTPupdateserver added
+*/
+
 #include <ESP8266WiFi.h>
 #include <TimeLib.h>
-//OTA
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>            //Local DNS Server used for redirecting all requests to the configuration portal
 
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPUpdateServer.h>
+
 #include <PubSubClient.h>
 #include <credentials.h>          //mySSID, myPASSWORD, IFTTT_KEY
-
 #include <IFTTTMaker.h>
 #include <WiFiClientSecure.h>
+
+// for HTTPupdate
+const char* host = "fire-alarm";
+ESP8266WebServer httpServer(80);
+ESP8266HTTPUpdateServer httpUpdater;
 
 /*credentials & definitions */
 //MQTTT
 const char* mqtt_server = "192.168.10.104";
+const char* mqtt_willTopic = "sensor/smokedetector/state";
+const char* mqtt_id = "Firedetection-Client";
+
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -51,6 +66,9 @@ uint32_t time1, time2, lastReconnectAttempt = 0, statustime = 0;
 
 int program_mode = NORMAL_MODE; // this defines the mode of the program (normal or OTAflash)
 
+String tmp_str; // String for publishing the int's as a string to MQTT
+char buf[5];
+
 void setup()
 {
   // set pinmodes
@@ -66,35 +84,42 @@ void setup()
   // set program mode
   if (digitalRead(OTAPIN) == LOW)
   {
-    program_mode = OTAFLASH_MODE;       // blink red led
+    program_mode = OTAFLASH_MODE;
     for (int i = 0 ; i < 5; i++)
     {
-      digitalWrite(REDLEDPIN, HIGH);   
+      digitalWrite(REDLEDPIN, HIGH);    // blink green led on
       delay(100);
-      digitalWrite(REDLEDPIN, LOW);    
+      digitalWrite(REDLEDPIN, LOW);    // blink green led off
       delay(100);
     }
   }
   else
   {
-    for (int i = 0 ; i < 5; i++)        // blink green led
+    for (int i = 0 ; i < 5; i++)
     {
-      digitalWrite(GREENLEDPIN, HIGH);     
+      digitalWrite(GREENLEDPIN, HIGH);    // blink green led on
       delay(100);
-      digitalWrite(GREENLEDPIN, LOW);    
+      digitalWrite(GREENLEDPIN, LOW);    // blink green led off
       delay(100);
     }
   }
-  setup_wifi();
+  setup_wifi();     //connect tot wifi
+
+  // for HTTPudate
+  MDNS.begin(host);
+  httpUpdater.setup(&httpServer);
+  httpServer.begin();
+
+  MDNS.addService("http", "tcp", 80);
   client.setServer(mqtt_server, 1883);
-  //client.setCallback(callback);
+  //client.setCallback(callback);     
   if (!client.connected()) {
     digitalWrite(GREENLEDPIN, LOW);
     reconnect();
   }
   if (client.connected())
     digitalWrite(GREENLEDPIN, HIGH);
-  client.publish("sensor/smokedetector/state", "Smoke detector Started");
+  client.publish("sensor/smokedetector/debug", "Started");
   statustime = now();
 
   // switch in setup
@@ -104,42 +129,15 @@ void setup()
       {
         if (digitalRead(FIREDETECTPIN) == HIGH)    // no fire detected
         {
-          client.publish("sensor/smokedetector/alarm", "OFF");
-          client.publish("sensor/smokedetector/state", "Status ok, no fire detected");
+          client.publish("sensor/smokedetector/alarm", "NOFIRE");
+          client.publish("sensor/smokedetector/state", "Status OK");
         }
         break;
       }
     case OTAFLASH_MODE:
       {
-        client.publish("sensor/smokedetector/state", "Smoke detector in OTA mode");
-        ArduinoOTA.onStart([]() {
-          String type;
-          if (ArduinoOTA.getCommand() == U_FLASH)
-            type = "sketch";
-          else // U_SPIFFS
-            type = "filesystem";
-
-          // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-          Serial.println("Start updating " + type);
-        });
-        ArduinoOTA.onEnd([]() {
-          Serial.println("\nEnd");
-        });
-        ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-          Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-        });
-        ArduinoOTA.onError([](ota_error_t error) {
-          Serial.printf("Error[%u]: ", error);
-          if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-          else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-          else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-          else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-          else if (error == OTA_END_ERROR) Serial.println("End Failed");
-        });
+        client.publish("sensor/smokedetector/state", "OTA mode");
         ArduinoOTA.begin();
-        Serial.print("OTA Ready on IP address: ");
-        Serial.println(WiFi.localIP());
-        // end OTA routine
         break;
       }
   }
@@ -156,13 +154,15 @@ void loop()
         {
           digitalWrite(GREENLEDPIN, LOW);
           time1 = now();
-          if (time1 < lastReconnectAttempt + MQTT_CONNECT_DELAY)
+          if (time1 > lastReconnectAttempt + MQTT_CONNECT_DELAY)
           {
             lastReconnectAttempt = time1;
             // Attempt to reconnect
             if (reconnect()) {
               lastReconnectAttempt = 0;
               digitalWrite(GREENLEDPIN, HIGH);
+              client.publish("sensor/smokedetector/state", "reconnected");
+              client.publish("sensor/smokedetector/alarm", "NOFIRE");
             }
           }
         }
@@ -171,11 +171,13 @@ void loop()
             main program here
         */
         client.loop();
+        httpServer.handleClient();    // for HTTPupdate
+        
         //check whether Fire is detected
         if (digitalRead(FIREDETECTPIN) == LOW && firedetected == false)    // fire detected and previously not
         {
           time2 = millis();
-          client.publish("sensor/smokedetector/state", "fire is detected!, wait for debounce");
+          client.publish("sensor/smokedetector/debug", "fire! debounce");
           delay(10);
           yield();
           while (millis() < time2 + DEBOUNCE)
@@ -186,30 +188,31 @@ void loop()
             {
               firedetected = false;
 
-              client.publish("sensor/smokedetector/state", "alarm reset during debounce");
+              client.publish("sensor/smokedetector/debug", "alarm reset");
               break;
             }
           }
-          client.publish("sensor/smokedetector/state", "debounce ended");
+          client.publish("sensor/smokedetector/debug", "debounce ended");
           if (firedetected)
           {
             digitalWrite(REDLEDPIN, HIGH);
-            client.publish("sensor/smokedetector/alarm", "ON");
-            client.publish("sensor/smokedetector/state", "fire is detected!");
+            client.publish("sensor/smokedetector/alarm", "FIRE");
+            client.publish("sensor/smokedetector/state", "fire!");
             statustime = now();
 
             //IFTTT actions
             if (ifttt.triggerEvent(EVENT_NAME1, mySSID, ip.toString()))
-              client.publish("sensor/smokedetector/state", "IFTTT 1 sent ok");
+              client.publish("sensor/smokedetector/debug", "IFTTT 1 sent ok");
             if (ifttt.triggerEvent(EVENT_NAME2, mySSID, ip.toString()))
-              client.publish("sensor/smokedetector/state", "IFTTT 2 sent ok");
+              client.publish("sensor/smokedetector/debug", "IFTTT 2 sent ok");
           }
         }
         if (digitalRead(FIREDETECTPIN) == HIGH && firedetected == true)    // fire previously detected and not any more
         {
           firedetected = false;
-          client.publish("sensor/smokedetector/alarm", "OFF");
-          client.publish("sensor/smokedetector/state", "no more fire detected");
+          client.publish("sensor/smokedetector/alarm", "NOFIRE");
+          client.publish("sensor/smokedetector/debug", "no more fire");
+          client.publish("sensor/smokedetector/state", "Status OK");
           digitalWrite(REDLEDPIN, LOW);
           statustime = now();
         }
@@ -218,14 +221,15 @@ void loop()
         if (now() > statustime + OKSENDDELAY)
         {
           client.publish("sensor/smokedetector/state", "Status OK");
+          client.publish("sensor/smokedetector/alarm", "NOFIRE");
           statustime = now();
         }
 
         //publish status when fire is detected
         if (now() > statustime + FIRESENDDELAY && firedetected == true)
         {
-          client.publish("sensor/smokedetector/alarm", "ON");
-          client.publish("sensor/smokedetector/state", "fire is detected!");
+          client.publish("sensor/smokedetector/alarm", "FIRE");
+          client.publish("sensor/smokedetector/state", "fire!");
           statustime = now();
         }
 
@@ -242,27 +246,30 @@ void loop()
 void setup_wifi()
 {
   // We connect to the WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(mySSID);
+  /*
+    Serial.println();
+    Serial.print("Connecting to ");
+    Serial.println(mySSID);
+  */
   WiFi.mode(WIFI_STA);
   WiFi.begin(mySSID, myPASSWORD);
   time1 = now();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    // Serial.print(".");
     if (now() > time1 + WIFI_CONNECT_TIMEOUT)
       ESP.restart();
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  //  ip = WiFi.localIP();
+  /*
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+    //  ip = WiFi.localIP();
+  */
 }
 
 /*
-  not subscibed to any topic, no callback function needed
   void callback(char* topic, byte * payload, unsigned int length) {
   Serial.print("Message arrived [");
   Serial.print(topic);
@@ -278,12 +285,12 @@ boolean reconnect()
   if (WiFi.status() != WL_CONNECTED) {    // check if WiFi connection is present
     setup_wifi();
   }
-  Serial.println("Attempting MQTT connection...");
-  if (client.connect("Firedetection-Client")) {
-    Serial.println("connected");
+  //Serial.println("Attempting MQTT connection...");
+  if (client.connect(mqtt_id, mqtt_willTopic, 0, 0, "ERROR")) {    // connect(const char *id, const char* willTopic, uint8_t willQos, boolean willRetain, const char* willMessage)
+    //Serial.println("connected");
     // ... and resubscribe
   }
-  Serial.println(client.connected());
+  //Serial.println(client.connected());
   return client.connected();
 }
 
