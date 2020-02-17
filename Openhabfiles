@@ -1,0 +1,50 @@
+.items file
+String Fire_alarm "Fire Alarm [%s]" <fire>  {mqtt="<[mosquitto:sensor/smokedetector/alarm:state:default]"}
+String Fire_alarm_state "Fire Alarm state [%s]" <fire>  {mqtt="<[mosquitto:sensor/smokedetector/state:state:default]"}
+
+----------
+
+.sitemap file
+    Frame label="Alarm"
+    {
+		Text item=Fire_alarm_state
+    }
+    
+----------
+
+.rules files
+//fire detection
+rule "Fire detection error"
+when
+	Item Fire_alarm_state changed to ERROR
+then
+	logInfo("Fire alarm","Fire detection error, wait for debounce")
+	errordebounce = createTimer(now.plusMinutes(1)) [|
+		if(Fire_alarm_state.state=="ERROR")
+		{
+		//sendBroadcastNotification("Fire detection has an error")    // broadcast to all connected Openhab apps
+		//sendTelegram("bot1", "Fire detection has an error")         // Via the Telegram Action (needs definition of bots)
+		logInfo("Fire alarm","Fire detection error, send notification")
+		}
+	]
+	errordebounce = null
+end
+
+rule "Fire detected notification"
+when
+	Item Fire_alarm changed from NOFIRE to FIRE
+then
+	logInfo("Fire alarm","Fire detected rule fired")
+	sendBroadcastNotification("Fire detected!")                   // broadcast to all connected Openhab apps
+	sendTelegram("bot1", "Fire detected!")                        // Via the Telegram Action (needs definition of bots)
+end
+
+
+rule "Fire not detected notification"
+when
+	Item Fire_alarm changed from FIRE to NOFIRE
+then
+	logInfo("Fire alarm","No more Fire detected rule fired")
+	sendBroadcastNotification("Fire no more detected!")
+	sendTelegram("bot1", "Fire no more detected!")
+end
